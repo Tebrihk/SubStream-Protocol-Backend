@@ -24,15 +24,19 @@ const VideoProcessingWorker = require('./src/services/videoProcessingWorker');
 const { BackgroundWorkerService } = require('./src/services/backgroundWorkerService');
 const GlobalStatsService = require('./src/services/globalStatsService');
 const GlobalStatsWorker = require('./src/services/globalStatsWorker');
+const { AMLScannerWorker } = require('./src/services/amlScannerWorker');
 const createVideoRoutes = require('./routes/video');
 const createGlobalStatsRouter = require('./routes/globalStats');
 const createDeviceRoutes = require('./routes/device');
 const createSwaggerRoutes = require('./routes/swagger');
+const { createAMLRoutes } = require('./routes/aml');
+const { createAMLDashboardRoutes } = require('./routes/amlDashboard');
 const { buildAuditLogCsv } = require('./src/utils/export/auditLogCsv');
 const { buildAuditLogPdf } = require('./src/utils/export/auditLogPdf');
 const { getRequestIp } = require('./src/utils/requestIp');
 const { getRedisClient, closeRedisClient } = require('./src/config/redis');
 const { createRateLimiter } = require('./middleware/rateLimiter');
+const { createAMLCheckMiddleware, createSubscriptionAMLCheck } = require('./middleware/amlCheck');
 const { DeviceFingerprintService } = require('./src/services/deviceFingerprintService');
 
 /**
@@ -66,7 +70,7 @@ function createApp(dependencies = {}) {
       notificationService,
       emailUtil: { sendEmail },
     });
-    dependencies.subscriptionService || new SubscriptionService({ database, auditLogService, config });
+  dependencies.subscriptionService || new SubscriptionService({ database, auditLogService, config });
   const subscriptionExpiryChecker =
     dependencies.subscriptionExpiryChecker ||
     new SubscriptionExpiryChecker({
@@ -139,16 +143,48 @@ function createApp(dependencies = {}) {
     console.error('Failed to start global stats worker:', error);
   });
 
+  // Initialize and start AML scanner if enabled
+  let amlScannerWorker = null;
+  if (config.aml && config.aml.enabled) {
+    amlScannerWorker = dependencies.amlScannerWorker || new AMLScannerWorker(database, config.aml);
+    app.set('amlScannerWorker', amlScannerWorker);
+
+    amlScannerWorker.start().catch(error => {
+      console.error('Failed to start AML scanner worker:', error);
+    });
+
+    console.log('AML Scanner Worker initialized');
+  }
+
   app.use(cors());
   app.use(express.json());
-  
+
   // Add request tracing middleware for structured logging
   app.use(requestTracingMiddleware);
+
+  // Add AML check middleware if enabled
+  if (amlScannerWorker) {
+    const amlCheckMiddleware = createAMLCheckMiddleware(amlScannerWorker);
+    const subscriptionAMLCheck = createSubscriptionAMLCheck(amlScannerWorker);
+
+    // Apply AML checks to sensitive endpoints
+    app.use('/api/cdn', amlCheckMiddleware);
+    app.use('/api/creator', amlCheckMiddleware);
+    app.use('/api/subscription', subscriptionAMLCheck);
+    app.use('/api/payouts', amlCheckMiddleware);
+
+    // AML management routes (admin only - should be protected by auth middleware)
+    app.use('/api/aml', createAMLRoutes({ amlScannerWorker }));
+
+    // AML dashboard routes (enhanced monitoring and analytics)
+    app.use('/api/aml-dashboard', createAMLDashboardRoutes({ amlScannerWorker, database }));
+  }
+
   // Subscription events webhook
   app.use('/api/subscription', require('./routes/subscription'));
   // Payouts API
   app.use('/api/payouts', require('./routes/payouts'));
-  
+
   // Global stats endpoints
   app.use('/api/global-stats', createGlobalStatsRouter({ database, globalStatsService }));
 
@@ -414,6 +450,7 @@ function createApp(dependencies = {}) {
         redis: 'Unknown',
         rabbitmq: 'Unknown',
         stellar: 'Unknown',
+        aml: 'Unknown',
       },
     };
 
@@ -470,6 +507,20 @@ function createApp(dependencies = {}) {
       isDegraded = true;
     }
 
+    // Check AML Scanner
+    try {
+      if (amlScannerWorker) {
+        const stats = amlScannerWorker.getScanStats();
+        health.services.aml = stats.isRunning ? 'Running' : 'Stopped';
+        if (!stats.isRunning) isDegraded = true;
+      } else {
+        health.services.aml = 'Not Enabled';
+      }
+    } catch (error) {
+      health.services.aml = 'Error';
+      isDegraded = true;
+    }
+
     if (isDegraded) {
       health.status = 'Degraded';
     }
@@ -478,7 +529,7 @@ function createApp(dependencies = {}) {
   });
 
   app.use((req, res) => res.status(404).json({ success: false, error: 'Not found' }));
-  
+
   // Global error handler with Sentry integration
   app.use((err, req, res, next) => {
     // Log error with structured logging
@@ -489,15 +540,15 @@ function createApp(dependencies = {}) {
       walletAddress: req.user?.publicKey || req.body?.walletAddress,
       endpoint: req.originalUrl,
     };
-    
+
     // Capture with Sentry
     errorTracking.captureException(err, errorContext);
-    
+
     // Return error response
     res.status(err.statusCode || err.status || 500).json({
       success: false,
-      error: process.env.NODE_ENV === 'production' 
-        ? 'Internal server error' 
+      error: process.env.NODE_ENV === 'production'
+        ? 'Internal server error'
         : err.message,
       ...(process.env.NODE_ENV !== 'production' && { stack: err.stack }),
     });

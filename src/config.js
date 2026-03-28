@@ -76,6 +76,20 @@ function loadConfig(env = process.env) {
       emailQueue: env.RABBITMQ_EMAIL_QUEUE || 'substream_emails_queue',
       leaderboardQueue: env.RABBITMQ_LEADERBOARD_QUEUE || 'substream_leaderboard_queue',
     },
+    aml: {
+      enabled: env.AML_ENABLED === 'true',
+      scanInterval: Number(env.AML_SCAN_INTERVAL_MS || 24 * 60 * 60 * 1000), // Daily
+      batchSize: Number(env.AML_BATCH_SIZE || 50),
+      maxRetries: Number(env.AML_MAX_RETRIES || 3),
+      complianceOfficerEmail: env.COMPLIANCE_OFFICER_EMAIL || '',
+      sanctions: {
+        ofacApiKey: env.OFAC_API_KEY || '',
+        euSanctionsApiKey: env.EU_SANCTIONS_API_KEY || '',
+        unSanctionsApiKey: env.UN_SANCTIONS_API_KEY || '',
+        ukSanctionsApiKey: env.UK_SANCTIONS_API_KEY || '',
+        cacheTimeout: Number(env.SANCTIONS_CACHE_TIMEOUT_MS || 60 * 60 * 1000), // 1 hour
+      }
+    },
   };
 }
 
